@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Networking;
@@ -17,6 +16,11 @@ namespace Microsoft.MixedReality.WebRTC.Unity
     [AddComponentMenu("MixedReality-WebRTC/NodeDSS Signaler")]
     public class NodeDssSignaler : Signaler
     {
+        private bool _readyForPolling = false;
+
+        public event Action<SdpMessage> OnSdpMessageReceived;
+        public event Action<IceCandidate> OnIceCandidateReceived;
+
         /// <summary>
         /// Automatically log all errors to the Unity console.
         /// </summary>
@@ -55,7 +59,7 @@ namespace Microsoft.MixedReality.WebRTC.Unity
         /// The names of the fields is critical here for proper JSON serialization.
         /// </remarks>
         [Serializable]
-        private class NodeDssMessage
+        public class NodeDssMessage
         {
             /// <summary>
             /// Separator for ICE messages.
@@ -225,8 +229,6 @@ namespace Microsoft.MixedReality.WebRTC.Unity
             {
                 LocalPeerId = SystemInfo.deviceName;
             }
-            // In any case, make sure that the peer ID is a valid SDP token
-            LocalPeerId = Regex.Replace(LocalPeerId, SdpTokenAttribute.InvalidCharacters, "_");
         }
 
         /// <summary>
@@ -240,9 +242,17 @@ namespace Microsoft.MixedReality.WebRTC.Unity
                 throw new InvalidOperationException("Cannot send SDP message to remote peer; invalid empty remote peer ID.");
             }
 
-            var data = System.Text.Encoding.UTF8.GetBytes(JsonUtility.ToJson(msg));
+            // ⚠️ Hier eigene JSON-Struktur bauen
+            var safeData = msg.Data.Replace("\n", "\\n").Replace("\r", "");
+            var json = $"{{\"MessageType\":\"{msg.MessageType}\",\"Data\":\"{safeData}\"}}";
+
+            Debug.Log($"[DEBUG] Gesendetes JSON an Server: {json}");
+            var data = System.Text.Encoding.UTF8.GetBytes(json);
+
             var www = new UnityWebRequest($"{HttpServerAddress}data/{RemotePeerId}", UnityWebRequest.kHttpVerbPOST);
             www.uploadHandler = new UploadHandlerRaw(data);
+            www.SetRequestHeader("Content-Type", "application/json"); // 🟢 Jetzt explizit setzen!
+
 
             yield return www.SendWebRequest();
 
@@ -251,6 +261,7 @@ namespace Microsoft.MixedReality.WebRTC.Unity
                 Debug.Log($"Failed to send message to remote peer {RemotePeerId}: {www.error}");
             }
         }
+
 
         /// <summary>
         /// Internal helper to wrap a coroutine into a synchronous call for use inside
@@ -269,8 +280,29 @@ namespace Microsoft.MixedReality.WebRTC.Unity
         /// and processing it as needed
         /// </summary>
         /// <returns>the message</returns>
+        /// 
+
+        [Serializable]
+        public class NodeDssJsonMessage
+        {
+            public string MessageType;
+            public string Data;
+        }
+
+        private bool IsNativePeerReady()
+        {
+            return _nativePeer != null && _nativePeer.Initialized;
+        }
+
         private IEnumerator CO_GetAndProcessFromServer()
         {
+            // ...
+            if (!IsNativePeerReady())
+            {
+                Debug.LogWarning("Signal empfangen, aber Native Peer noch nicht ready. Warte auf nächste Poll-Iteration.");
+                lastGetComplete = true;
+                yield break;
+            }
             if (HttpServerAddress.Length == 0)
             {
                 throw new InvalidOperationException("Cannot receive SDP messages from remote peer; invalid empty HTTP server address.");
@@ -286,92 +318,145 @@ namespace Microsoft.MixedReality.WebRTC.Unity
             if (!www.isNetworkError && !www.isHttpError)
             {
                 var json = www.downloadHandler.text;
-
-                var msg = JsonUtility.FromJson<NodeDssMessage>(json);
-
-                // if the message is good
-                if (msg != null)
+                // Verwende unsere neue Hilfsklasse zum Parsen des JSON
+                var jsonMsg = JsonUtility.FromJson<NodeDssJsonMessage>(json);
+                if (jsonMsg != null)
                 {
-                    // depending on what type of message we get, we'll handle it differently
-                    // this is the "glue" that allows two peers to establish a connection.
-                    DebugLogLong($"Received SDP message: type={msg.MessageType} data={msg.Data}");
-                    switch (msg.MessageType)
+                    DebugLogLong($"[DEBUG] Empfangene Nachricht: MessageType={jsonMsg.MessageType} | Data Length={jsonMsg.Data?.Length}");
+
+                    // WICHTIG: Überprüfe, ob die native PeerConnection initialisiert ist.
+                    if (_nativePeer == null)
                     {
-                    case NodeDssMessage.Type.Offer:
-                        // Apply the offer coming from the remote peer to the local peer
-                        var sdpOffer = new WebRTC.SdpMessage { Type = SdpMessageType.Offer, Content = msg.Data };
-                        PeerConnection.HandleConnectionMessageAsync(sdpOffer).ContinueWith(_ =>
-                        {
-                            // If the remote description was successfully applied then immediately send
-                            // back an answer to the remote peer to acccept the offer.
-                            _nativePeer.CreateAnswer();
-                        }, TaskContinuationOptions.OnlyOnRanToCompletion | TaskContinuationOptions.RunContinuationsAsynchronously);
-                        break;
-
-                    case NodeDssMessage.Type.Answer:
-                        // No need to wait for completion; there is nothing interesting to do after it.
-                        var sdpAnswer = new WebRTC.SdpMessage { Type = SdpMessageType.Answer, Content = msg.Data };
-                        _ = PeerConnection.HandleConnectionMessageAsync(sdpAnswer);
-                        break;
-
-                    case NodeDssMessage.Type.Ice:
-                        // this "parts" protocol is defined above, in OnIceCandidateReadyToSend listener
-                        _nativePeer.AddIceCandidate(msg.ToIceCandidate());
-                        break;
-
-                    default:
-                        Debug.Log("Unknown message: " + msg.MessageType + ": " + msg.Data);
-                        break;
+                        Debug.LogWarning("Native PeerConnection ist noch nicht initialisiert – Verarbeitung der Remote-Nachricht wird übersprungen.");
+                        lastGetComplete = true;
+                        yield break;
                     }
 
-                    timeSincePollMs = PollTimeMs + 1f; //fast forward next request
+                    Debug.Log($"🟢 JSON empfangen: MessageType={jsonMsg.MessageType}, DataLength={jsonMsg.Data.Length}");
+
+                    switch (jsonMsg.MessageType.ToLowerInvariant())
+                    {
+                        case "offer":
+                        case "answer":
+                            var sdpMsg = new WebRTC.SdpMessage
+                            {
+                                Type = jsonMsg.MessageType.ToLowerInvariant() == "offer" ? SdpMessageType.Offer : SdpMessageType.Answer,
+                                Content = jsonMsg.Data.Replace("\\n", "\n")
+                            };
+
+                            if (OnSdpMessageReceived != null)
+                            {
+                                Debug.Log($"🔥 [EVENT] OnSdpMessageReceived feuert jetzt mit {sdpMsg.Type}");
+                            }
+                            else
+                            {
+                                Debug.LogWarning("⚠️ Kein Subscriber für OnSdpMessageReceived vorhanden");
+                            }
+
+                            OnSdpMessageReceived?.Invoke(sdpMsg);
+                            break;
+
+                        case "ice":
+                            var iceParts = jsonMsg.Data.Replace("\\n", "\n").Split(NodeDssMessage.IceSeparatorChar);
+                            if (iceParts.Length == 3)
+                            {
+                                var iceCandidate = new IceCandidate
+                                {
+                                    SdpMid = iceParts[0],
+                                    SdpMlineIndex = int.Parse(iceParts[1]),
+                                    Content = iceParts[2]
+                                };
+
+                                if (OnIceCandidateReceived != null)
+                                {
+                                    Debug.Log($"🔥 [EVENT] OnIceCandidateReceived feuert jetzt");
+                                }
+                                else
+                                {
+                                    Debug.LogWarning("⚠️ Kein Subscriber für OnIceCandidateReceived vorhanden");
+                                }
+
+                                OnIceCandidateReceived?.Invoke(iceCandidate);
+                            }
+                            break;
+
+                        default:
+                            Debug.LogWarning($"⚠️ Unbekannter MessageType empfangen: {jsonMsg.MessageType}");
+                            break;
+                    }
+
+
+
+
                 }
                 else if (AutoLogErrors)
                 {
-                    Debug.LogError($"Failed to deserialize JSON message : {json}");
+                    Debug.LogError($"❌ JSON Parsing-Fehler: {json}");
                 }
             }
             else if (AutoLogErrors && www.isNetworkError)
             {
                 Debug.LogError($"Network error trying to send data to {HttpServerAddress}: {www.error}");
             }
-            else
-            {
-                // This is very spammy because the node-dss protocol uses 404 as regular "no data yet" message, which is an HTTP error
-                //Debug.LogError($"HTTP error: {www.error}");
-            }
 
             lastGetComplete = true;
         }
 
+        // Feld hinzufügen
+        private bool _pollingEnabled = false;
+
+        // Event-Callback (aus dem Inspector aufrufbar)
+        public void EnablePolling()
+        {
+            _pollingEnabled = true;
+            Debug.Log("Signaler: Polling wurde über OnInitialized aktiviert.");
+        }
+
+        public void DisablePolling()
+        {
+            _pollingEnabled = false;
+            Debug.Log("Signaler: Polling wurde deaktiviert.");
+        }
+
+        /// Wird vom Setup explizit aufgerufen, wenn alles korrekt subscribed wurde.
+        public void EnableSafePolling()
+        {
+            _readyForPolling = true;
+            _pollingEnabled = true;
+            Debug.Log("🟢 Signaler Safe-Polling wurde aktiviert nach vollständigem Setup.");
+        }
+
+
+
+
+
+
         /// <inheritdoc/>
         protected override void Update()
         {
-            // Do not forget to call the base class Update(), which processes events from background
-            // threads to fire the callbacks implemented in this class.
             base.Update();
 
-            // If we have not reached our PollTimeMs value...
+            if (!_pollingEnabled || !_readyForPolling)
+            {
+                return;
+            }
+
             if (timeSincePollMs <= PollTimeMs)
             {
-                // ...then we keep incrementing our local counter until we do.
                 timeSincePollMs += Time.deltaTime * 1000.0f;
                 return;
             }
 
-            // If we have a pending request still going, don't queue another yet.
             if (!lastGetComplete)
             {
                 return;
             }
 
-            // When we have reached our PollTimeMs value...
             timeSincePollMs = 0f;
-
-            // ...begin the poll and process.
-            lastGetComplete = false;
             StartCoroutine(CO_GetAndProcessFromServer());
         }
+
+
 
         private void DebugLogLong(string str)
         {
